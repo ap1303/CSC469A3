@@ -1,11 +1,12 @@
-#define _GNU_SOURCE         /* See feature_test_macros(7) */
+#define _GNU_SOURCE
 #include <sched.h>
 #include <stdlib.h>
-#include "memlib.h"
+#include <stddef.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include "mm_thread.h"
+#include "memlib.h"
 
 #define HEAP_MAX_SIZE 20
 #define PAGE_SIZE 4 * 1024
@@ -17,13 +18,13 @@
 
 #define SUPERPAGE_NUM 4 // every superpage contains 4 base pages
 
-name_t myName = {
+//name_t myName = {
 	/* Allocator Name */
-	"Lockless Memalloc",
+//	"Lockless Memalloc",
 	/* Team Member */
-	"Peizhi Zhang",
-	"peizhi.zhang@mail.utoronto.com"
-};
+//	"Peizhi Zhang",
+//	"peizhi.zhang@mail.utoronto.com"
+//};
 
 
 typedef struct {
@@ -36,11 +37,12 @@ typedef struct {
 // Superpage descriptor structure
 typedef struct descriptor {
 	anchor Anchor;
-	descriptor *Next;
+	struct descriptor *Next; // unknown type name
 	void *sb; // pointer to superpage
-	procheap *heap; // pointer to owner procheap
 	int sz; // page size
 	int maxcount; // superpage size/sz
+        int procheap_num; // the index of the processor heap that it belongs to 
+        int index; 
 } descriptor;
 
 // primarily a pointer to the descriptor of the superpage
@@ -59,274 +61,325 @@ typedef struct procheap {
 	active Active; // initially NULL
 	descriptor *Partial; // initially NULL
 	sizeclass *sc; // pointer to parent sizeclass
+        int index; // the index of the heap in heap_array
 } procheap;
 
-descriptor* DescAvail; // initially NULL
+descriptor *DescAvail;
 procheap *heap_array;
 
+int min(int a, int b) { return a > b ? b : a; }
+
 void *AllocNewSBFromMemory(int sbsize) {
-	   ptrdiff_f increment = sbsize
-	   return mem_sbrk(increment);
+     ptrdiff_t increment = sbsize;
+     return mem_sbrk(increment);
 }
 
-descriptor *AllocNewSB(int sbsize) {
-	  descriptor *desc;
-		ptrdiff_f increment = sbsize
-		desc->sb = AllocNewSBFromMemory(increment);
-    return desc
+descriptor *AllocNewSB(int sbsize) { 
+    descriptor *desc = (descriptor *) mem_sbrk(sizeof(descriptor));
+    desc->sb = AllocNewSBFromMemory(sbsize);
+    return desc;
 }
 
-descriptor* DescAlloc() {
+descriptor *DescAlloc() {
+    _Atomic(descriptor *) placeholder;
+    atomic_init(&placeholder, DescAvail);
+    descriptor *desc  = DescAvail;
     while (1) {
-			descriptor *desc = DescAvail;
-      if (desc) {
-          next = desc->Next;
-          if atomic_compare_exchange_strong(&DescAvail,desc,next) break;
-      } else {
-          desc = AllocNewSB(SUPERPAGE_NUM * PAGE_SIZE);
-					DescAvail->next = desc;
-          atomic_thread_fence(memory_order_seq_cst);
-          if atomic_compare_exchange_weak(&DescAvail,NULL,desc->Next)) break;
-      }
-   }
-   return desc;
+       if (desc) {
+           struct descriptor *next = desc->Next;  
+           if (atomic_compare_exchange_strong(&placeholder,&desc,next)) break; 
+       } else {
+           desc = AllocNewSB(SUPERPAGE_NUM * PAGE_SIZE);
+	   DescAvail = desc;
+           atomic_thread_fence(memory_order_seq_cst);
+           descriptor *temp = NULL;
+           struct descriptor *next = desc->Next;
+           if (atomic_compare_exchange_weak(&placeholder,&temp,next)) break;
+       }
+    }
+    return desc;
 }
 
-void DescRetire(descrptor *desc) {
+void DescRetire(descriptor *desc) {
+    _Atomic(descriptor *) placeholder;
+    atomic_init(&placeholder, DescAvail);
+    descriptor *oldhead = desc;
     do {
        oldhead = DescAvail;
        desc->Next = oldhead;
        atomic_thread_fence(memory_order_seq_cst);
-    } while(!atomic_compare_exchange_weak(&DescAvail,oldhead,desc));
+    } while(!atomic_compare_exchange_weak(&placeholder,&oldhead,desc)); // invalid initializer
 }
 
 void ListPutPartial(descriptor *partial, procheap *heap, int sz) {
-	   descriptor *temp;
+     descriptor *temp;
      if (sz) {
-			 temp = heap->sz->Partial;
-		 } else {
-			 temp = heap->Partial;
-		 }
-		 while(temp != NULL & temp->next != NULL) {
-				 temp = temp->next;
-		 }
-		 temp->next = partial;
+         temp = heap->sc->Partial;
+     } else {
+	 temp = heap->Partial;
+     }
+     while((temp != NULL) && (temp->Next != NULL)) {
+	temp = temp->Next;
+     }
+     temp->Next = partial;
 }
 
 descriptor *ListGetPartial(sizeclass *sc) {
-	   descriptor *temp = sc->Partial;
-		 sc->partial = sc->Partial->next;
-		 return temp;
+    descriptor *temp = sc->Partial;
+    sc->Partial = sc->Partial->Next;
+    return temp;
 }
 
 void ListRemoveEmptyDesc(sizeclass *sc) {
-	   descriptor *temp = sc->Partial;
-	   while (1) {
-			 if (temp->sb == NULL) {
-				   sc->Partial = sc->Partial->next;
-					 temp = sc->Partial;
-					 continue;
-			 } else {
-				   temp = temp->next;
-					 continue;
-			 }
-			 if (temp->next == NULL) {
-				   break;
-			 }
-	   }
+     descriptor *temp = sc->Partial;
+     while (1) {
+	 if (temp->sb == NULL) {
+	     sc->Partial = sc->Partial->Next;
+	     temp = sc->Partial;
+	     continue;
+	 } else {
+	     temp = temp->Next;
+	     continue;
+	 }
+	 if (temp->Next == NULL) {
+	     break;
+	 }
+      }
 }
 
 void HeapPutPartial(descriptor *desc) {
+     descriptor *prev;
+     procheap heap = heap_array[desc->procheap_num];
+     _Atomic(descriptor *) placeholder; 
+     atomic_init(&placeholder, heap.Partial);
      do {
-	       prev = desc->heap->Partial;
-     } while (!atomic_compare_exchange_weak(&desc->heap->Partial,prev,desc))
-     if (prev) ListPutPartial(prev, desc->heap, 1);
+	  prev = heap.Partial;
+     } while (!atomic_compare_exchange_weak(&placeholder,&prev,desc)); 
+     if (prev) ListPutPartial(prev, heap_array + desc->procheap_num, 1);
 }
 
 descriptor *HeapGetPartial(procheap *heap) {
+    descriptor *desc;
+    descriptor *Partial = heap->Partial;
+    _Atomic(descriptor *) placeholder;
+    atomic_init(&placeholder, Partial); 
     do {
         desc = heap->Partial;
         if (desc == NULL)
           return ListGetPartial(heap->sc);
-    } while (!atomic_compare_exchange_weak(&heap->Partial,desc,NULL))
+    } while (!atomic_compare_exchange_weak(&placeholder,&desc,NULL)); // invalid initializer
     return desc;
 }
 
 void RemoveEmptyDesc(procheap *heap,descriptor *desc) {
-  if atomic_compare_exchange_weak(&heap->Partial,desc,NULL) {
-	   DescRetire(desc);
+  descriptor *partial = heap->Partial;
+  _Atomic(descriptor *) placeholder;
+  atomic_init(&placeholder, partial);
+  descriptor *temp = NULL;
+  if (atomic_compare_exchange_weak(&placeholder,&desc,temp)) { // invalid initializer
+      DescRetire(desc);
   } else {
-		 ListRemoveEmptyDesc(heap->sc);
-	}
+      ListRemoveEmptyDesc(heap->sc);
+  }    
 }
 
 void UpdateActive(procheap *heap, descriptor *desc, int morecredits) {
-	curActive = desc;
-  curActive.credits = morecredits - 1;
-  if atomic_compare_exchange_weak(&heap->Active,NULL,curActive)
-	    return;
-  do {
-		anchor prevAnchor = desc->Anchor;
-		anchor curAnchor = prevanchor;
-		curAnchor.count += morecredits;
-		curAnchor.state = STATE_PARTIAL;
-	} while(!atomic_compare_exchange_weak(&desc->Anchor,prevAnchor,curAnchor))
-  HeapPutPartial();
+     active curActive = heap_array[desc->procheap_num].Active;
+     curActive.credits = morecredits - 1;
+     active *temp = NULL;
+     _Atomic(active) placeholder;
+     atomic_init(&placeholder, heap->Active); 
+     if (atomic_compare_exchange_weak(&placeholder,temp,curActive)) { // size mismatch
+	exit(0);
+     }
+     anchor prevAnchor;
+     anchor curAnchor;
+     _Atomic(anchor) placeholder1;
+     atomic_init(&placeholder1, desc->Anchor);
+     do {
+	prevAnchor = desc->Anchor;
+	curAnchor = prevAnchor;
+	curAnchor.count += morecredits;
+	curAnchor.state = STATE_PARTIAL;
+     } while(!atomic_compare_exchange_weak(&placeholder1, &prevAnchor, curAnchor));
+     HeapPutPartial(desc);
 }
 
 void* MallocFromActive(procheap *heap) {
-   do {
-		active prevActive = heap->Active;
-	  active curActice = prevActive;
-		if (!prevActive) return NULL;
-		if (prevActive.credits == 0)
-				curActive = NULL;
-		else
-				curActive.credits--;
-	} while(!atomic_compare_exchange_weak(&heap->Active, prevActive, curActive))
+      active *prevActive = &(heap->Active);
+      active *curActive = prevActive;
+      _Atomic(active) placeholder;
+      atomic_init(&placeholder, heap->Active); 
+      do {
+	    *prevActive = heap->Active;
+	    curActive = prevActive;
+            active* temp = NULL;
+	    if (prevActive == temp) return NULL; 
+	    if (prevActive->credits == 0)
+	       curActive = NULL; 
+	    else
+	       curActive->credits--;
+      } while(!atomic_compare_exchange_weak(&placeholder, prevActive, *curActive));// invalid initializer
 
-  descriptor *desc = prevActive->desc;
+      descriptor *desc = prevActive->desc;
+      int morecredits = 0;
+      anchor prevAnchor = desc->Anchor; 
+      anchor curAnchor = prevAnchor;
+      _Atomic(anchor) placeholder1 = ATOMIC_VAR_INIT(desc->Anchor); 
+      do {
+            prevAnchor = desc->Anchor;
+	    curAnchor = prevAnchor;
+            curAnchor.avail = prevAnchor.avail + 1;
+            curAnchor.tag++;
+            if (prevActive->credits == 0) {
+                if (prevAnchor.count == 0) {
+                    curAnchor.state = STATE_FULL;
+                } else {
+                    morecredits = min(prevAnchor.count,SUPERPAGE_NUM);
+                    curAnchor.count -= morecredits;
+                }
+            }
+     } while (!atomic_compare_exchange_weak(&placeholder1,&prevAnchor,curAnchor));
 
-  do {
-		 anchor prevAnchor = desc->Anchor;
-	   anchor curAnchor = prevAnchor;
-     void *addr = desc->sb + prevAnchor.avail * desc->sz;
-     void next = *(unsigned*)addr;
-     curAnchor.avail = next;
-     curAnchor.tag++;
-     if (prevActive.credits == 0) {
-         if (prevAnchor.count == 0)
-             curAnchor.state = STATE_FULL;
-          else {
-             morecredits = min(prevAnchor.count,SUPERPAGE_NUM);
-             curAnchor.count -= morecredits;
-         }
-		  }
-	 } while (!atomic_compare_exchange_weak(&desc->Anchor,prevAnchor,curAnchor))
+     if (prevActive->credits==0 && prevAnchor.count>0)
+	 UpdateActive(heap, desc, morecredits);
 
-   if (prevActive.credits==0 && prevAnchor.count>0)
-	    UpdateActive(heap, desc, morecredits);
-
-	 *addr = desc;
-	 return addr;
+      void *addr = desc->sb;
+      return addr;
 
 }
 
 void *MallocFromPartial(procheap *heap) {
+            descriptor *desc = heap->Partial;
+            anchor prevAnchor = desc->Anchor;
+	    anchor curAnchor = prevAnchor;
+            int morecredits = 0;
+            _Atomic(anchor) placeholder = ATOMIC_VAR_INIT(desc->Anchor);
 	    do {
-						descriptor *desc = HeapGetPartial(heap);
+		  desc = HeapGetPartial(heap);
 	          if (!desc) return NULL;
-	          desc->heap = heap;
+	          desc->procheap_num = heap->index;
 	          // reserve blocks
-						anchor prevAnchor = desc->Anchor;
-						anchor curAnchor = prevAnchor;
-		        if (prevAnchor.state == STATE_EMPTY) {
-		            DescRetire(desc);
-								continue;
-		         }
+		  prevAnchor = desc->Anchor;
+		  curAnchor = prevAnchor;
+		  if (prevAnchor.state == STATE_EMPTY) {
+		      DescRetire(desc);
+		      continue;
+		  }
+                  int morecredits = min(prevAnchor.count-1,SUPERPAGE_NUM);
+                  curAnchor.count -= morecredits+1;
+                  curAnchor.state = (morecredits > 0) ? STATE_ACTIVE : STATE_FULL;
+	      } while (!atomic_compare_exchange_weak(&placeholder,&prevAnchor, curAnchor));
 
-						int morecredits = min(prevAnchor.count-1,SUPERPAGE_NUM);
-            curAnchor.count -= morecredits+1;
-            curAnchor.state = (morecredits > 0) ? STATE_ACTIVE : STATE_FULL;
-			} while (!atomic_compare_exchange_weak(&desc->Anchor,prevAnchor,curAnchor))
+              do { // pop reserved block
+                   prevAnchor = desc->Anchor;
+                   curAnchor = prevAnchor;
+                   curAnchor.avail = prevAnchor.avail;
+                   curAnchor.tag++;
+              } while (!atomic_compare_exchange_weak(&placeholder,&prevAnchor,curAnchor));
 
-      do { // pop reserved block
-				  anchor prevAnchor = desc->Anchor;
-          anchor curAnchor = prevAnchor;
-          void *addr = desc->sb + prevAnchor.avail * desc->sz;
-          curAnchor.avail = * (unsigned*)addr;
-          curAnchor.tag++;
-      } while (!atomic_compare_exchange_weak(&desc->Anchor,prevAnchor,curAnchor))
+              if (morecredits > 0)
+                  UpdateActive(heap,desc,morecredits);
 
-      if (morecredits > 0)
-          UpdateActive(heap,desc,morecredits);
-
-      *addr = desc;
-			return addr;
+              void *addr = desc->sb;
+	      return addr;
 }
 
 void *MallocFromNewSB(procheap *heap) {
-      descrptor* desc = DescAlloc();
+      descriptor* desc = DescAlloc();
       desc->sb = AllocNewSB(heap->sc->sbsize);
-      desc->heap = heap;
+      desc->procheap_num = heap->index;
       desc->Anchor.avail = 1;
       desc->sz = heap->sc->sz;
       desc->maxcount = heap->sc->sbsize / desc->sz;
-      active curActive = desc;
+      active curActive = heap->Active;
       curActive.credits = min(desc->maxcount-1, SUPERPAGE_NUM) - 1;
       desc->Anchor.count = (desc->maxcount-1) - (curActive.credits+1);
       desc->Anchor.state = STATE_ACTIVE;
 
-			if (heap->Partial == NULL) {
-				  heap->Partial = desc;
-			} else {
-				  ListPutPartial(desc, heap, 0);
-			}
+      if (heap->Partial == NULL) {
+	  heap->Partial = desc;
+      } else {
+          ListPutPartial(desc, heap, 0);
+      }
+
       atomic_thread_fence(memory_order_seq_cst);
-      if atomic_compare_exchange_weak((&heap->Active,NULL,curActive) {
+      active *temp = NULL;
+      _Atomic(active) placeholder;
+      atomic_init(&placeholder, heap->Active);
+      if (atomic_compare_exchange_weak(&placeholder,temp,curActive)){ // size mismatch
          void *addr = desc->sb;
-         *addr = desc;
          return addr;
       } else {
          DescRetire(desc);
-				 return NULL;
-      }
+	 return NULL;
+      } // control reaches end of non-void function
 }
 
 void mm_init() {
-	   mem_init();
+     mem_init();
 
-		 // initialize processor
-		 sizeclass *sc;
-		 sc->sz = PAGE_SIZE;
-		 sc->sbsize = SUPERPAGE_NUM * PAGE_SIZE;
+     // initialize processor
+     sizeclass *sc = mem_sbrk((ptrdiff_t) sizeof(sizeclass));
+     sc->sz = PAGE_SIZE;
+     sc->sbsize = SUPERPAGE_NUM * PAGE_SIZE;
 
      int num = getNumProcessors();
-		 for(int i = 0; i < num; i++) {
-         heap_array->sc = sc;
-		 }
+     for(int i = 0; i < num; i++) {
+         heap_array[i].sc = sc;
+         heap_array[i].index = i;
+     }
 
-		 // as a simplification, pin execution to one processor
-		 // setCPU(0);
+     // as a simplification, pin execution to one processor
+     // setCPU(0);
+
 }
 
-void mm_malloc() {
+void *mm_malloc() {
      int cpu = sched_getcpu();
-		 procheap *heap = heap_array + cpu;
-		 while(1) {
-			 addr = MallocFromActive(heap);
-			 if (addr) return addr;
-			 addr = MallocFromPartial(heap);
-			 if (addr) return addr;
-			 addr = MallocFromNewSB(heap);
-			 if (addr) return addr;
-		 }
-
+     procheap *heap = heap_array + cpu;
+     while (1) {
+        void *addr = MallocFromActive(heap);
+        if (addr) return addr;
+        addr = MallocFromPartial(heap);
+        if (addr) return addr;
+        addr = MallocFromNewSB(heap);
+        if (addr) return addr;
+     } 
 }
 
 void mm_free(void *ptr) {
-	   if (!ptr) return;
+     if (!ptr) return;
      descriptor *desc = *(descriptor**)ptr;
-     void *sb = desc->sb;
+     anchor prevAnchor = desc->Anchor;
+     anchor curAnchor = prevAnchor;
+     procheap *heap;
+     _Atomic(anchor) placeholder = ATOMIC_VAR_INIT(desc->Anchor);
      do {
-			  anchor prevAnchor = desc->Anchor
-        anchor curAnchor = prevAnchor;
-        *(unsigned*)ptr = prevAnchor.avail;
-        curAnchor.avail = (ptr->sb) / desc->sz;
+	prevAnchor = desc->Anchor;
+        curAnchor = prevAnchor;
+        curAnchor.avail = prevAnchor.avail;
         if (prevAnchor.state == STATE_FULL)
             curAnchor.state = STATE_PARTIAL;
         if (prevAnchor.count == desc->maxcount - 1) {
-            procheap *heap = desc->heap;
+            heap = heap_array + desc->procheap_num;
             curAnchor.state = STATE_EMPTY;
         } else {
-					  curAnchor.count++;
-					  atomic_thread_fence(memory_order_seq_cst);
-				}
-      } while(!CAS(&desc->Anchor,prevAnchor,prevAnchor));
+	    curAnchor.count++;
+	    atomic_thread_fence(memory_order_seq_cst);
+	}
+      } while(!atomic_compare_exchange_weak(&placeholder, &prevAnchor,     curAnchor)); // invalid initializer
 
       if (prevAnchor.state == STATE_EMPTY) {
           RemoveEmptyDesc(heap,desc);
       } else if (prevAnchor.state == STATE_FULL) {
           HeapPutPartial(desc);
       }
+}
+
+int main() {
+    mm_init();
+    void *addr = mm_malloc();
+    printf("malloc-ed address is %p\n", addr);
+    mm_free(addr);  
 }
