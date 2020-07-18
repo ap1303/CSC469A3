@@ -69,17 +69,20 @@ procheap *heap_array;
 
 int min(int a, int b) { return a > b ? b : a; }
 
+// allocate physical pages in heap memory
 void *AllocNewSBFromMemory(int sbsize) {
      ptrdiff_t increment = sbsize;
      return mem_sbrk(increment);
 }
 
+// allocate superpage descriptor in heap memory
 descriptor *AllocNewSB(int sbsize) { 
     descriptor *desc = (descriptor *) mem_sbrk(sizeof(descriptor));
     desc->sb = AllocNewSBFromMemory(sbsize);
     return desc;
 }
 
+// allocate a superpage descriptor in heap memory
 descriptor *DescAlloc() {
     _Atomic(descriptor *) placeholder;
     atomic_init(&placeholder, DescAvail);
@@ -100,17 +103,19 @@ descriptor *DescAlloc() {
     return desc;
 }
 
+// retire a superpage descriptor
 void DescRetire(descriptor *desc) {
     _Atomic(descriptor *) placeholder;
     atomic_init(&placeholder, DescAvail);
-    descriptor *oldhead = desc;
+    descriptor *oldhead;
     do {
        oldhead = DescAvail;
        desc->Next = oldhead;
        atomic_thread_fence(memory_order_seq_cst);
-    } while(!atomic_compare_exchange_weak(&placeholder,&oldhead,desc)); // invalid initializer
+    } while(!atomic_compare_exchange_weak(&placeholder,&oldhead,desc)); 
 }
 
+// enqueue a partial descriptor at tail of the partial list of heap
 void ListPutPartial(descriptor *partial, procheap *heap, int sz) {
      descriptor *temp;
      if (sz) {
@@ -124,12 +129,14 @@ void ListPutPartial(descriptor *partial, procheap *heap, int sz) {
      temp->Next = partial;
 }
 
+// return the head descriptor of sc->Partial
 descriptor *ListGetPartial(sizeclass *sc) {
     descriptor *temp = sc->Partial;
     sc->Partial = sc->Partial->Next;
     return temp;
 }
 
+// remove empty descriptors of sc->Partial
 void ListRemoveEmptyDesc(sizeclass *sc) {
      descriptor *temp = sc->Partial;
      while (1) {
@@ -147,6 +154,7 @@ void ListRemoveEmptyDesc(sizeclass *sc) {
       }
 }
 
+// enqueue desc at tail of process heap
 void HeapPutPartial(descriptor *desc) {
      descriptor *prev;
      procheap heap = heap_array[desc->procheap_num];
@@ -158,6 +166,7 @@ void HeapPutPartial(descriptor *desc) {
      if (prev) ListPutPartial(prev, heap_array + desc->procheap_num, 1);
 }
 
+// return the list of descriptors of process heap
 descriptor *HeapGetPartial(procheap *heap) {
     descriptor *desc;
     descriptor *Partial = heap->Partial;
@@ -167,31 +176,35 @@ descriptor *HeapGetPartial(procheap *heap) {
         desc = heap->Partial;
         if (desc == NULL)
           return ListGetPartial(heap->sc);
-    } while (!atomic_compare_exchange_weak(&placeholder,&desc,NULL)); // invalid initializer
+    } while (!atomic_compare_exchange_weak(&placeholder,&desc,NULL)); 
     return desc;
 }
 
+// remove empty descriptors of process heap
 void RemoveEmptyDesc(procheap *heap,descriptor *desc) {
   descriptor *partial = heap->Partial;
   _Atomic(descriptor *) placeholder;
   atomic_init(&placeholder, partial);
   descriptor *temp = NULL;
-  if (atomic_compare_exchange_weak(&placeholder,&desc,temp)) { // invalid initializer
+  if (atomic_compare_exchange_weak(&placeholder,&desc,temp)) { 
       DescRetire(desc);
   } else {
       ListRemoveEmptyDesc(heap->sc);
   }    
 }
 
+// Update corresponding structures after installing desc->sb as
+// the active superblock of the process heap
 void UpdateActive(procheap *heap, descriptor *desc, int morecredits) {
      active curActive = heap_array[desc->procheap_num].Active;
      curActive.credits = morecredits - 1;
      active *temp = NULL;
      _Atomic(active) placeholder;
      atomic_init(&placeholder, heap->Active); 
-     if (atomic_compare_exchange_weak(&placeholder,temp,curActive)) { // size mismatch
+     if (atomic_compare_exchange_weak(&placeholder,temp,curActive)) {
 	exit(0);
      }
+     // in case some other thread installed another superblock
      anchor prevAnchor;
      anchor curAnchor;
      _Atomic(anchor) placeholder1;
@@ -201,10 +214,12 @@ void UpdateActive(procheap *heap, descriptor *desc, int morecredits) {
 	curAnchor = prevAnchor;
 	curAnchor.count += morecredits;
 	curAnchor.state = STATE_PARTIAL;
-     } while(!atomic_compare_exchange_weak(&placeholder1, &prevAnchor, curAnchor));
+     } while(!atomic_compare_exchange_weak(&placeholder1, &prevAnchor, curAnchor))
+     // make the superblock available for future use
      HeapPutPartial(desc);
 }
 
+// Malloc from the active superpage in processor heap
 void* MallocFromActive(procheap *heap) {
       active *prevActive = &(heap->Active);
       active *curActive = prevActive;
@@ -219,7 +234,7 @@ void* MallocFromActive(procheap *heap) {
 	       curActive = NULL; 
 	    else
 	       curActive->credits--;
-      } while(!atomic_compare_exchange_weak(&placeholder, prevActive, *curActive));// invalid initializer
+      } while(!atomic_compare_exchange_weak(&placeholder, prevActive, *curActive));
 
       descriptor *desc = prevActive->desc;
       int morecredits = 0;
@@ -249,6 +264,7 @@ void* MallocFromActive(procheap *heap) {
 
 }
 
+// Malloc from Partial superpage in processer heap
 void *MallocFromPartial(procheap *heap) {
             descriptor *desc = heap->Partial;
             anchor prevAnchor = desc->Anchor;
@@ -256,10 +272,10 @@ void *MallocFromPartial(procheap *heap) {
             int morecredits = 0;
             _Atomic(anchor) placeholder = ATOMIC_VAR_INIT(desc->Anchor);
 	    do {
+                  // reserve blocks
 		  desc = HeapGetPartial(heap);
 	          if (!desc) return NULL;
 	          desc->procheap_num = heap->index;
-	          // reserve blocks
 		  prevAnchor = desc->Anchor;
 		  curAnchor = prevAnchor;
 		  if (prevAnchor.state == STATE_EMPTY) {
@@ -274,7 +290,7 @@ void *MallocFromPartial(procheap *heap) {
               do { // pop reserved block
                    prevAnchor = desc->Anchor;
                    curAnchor = prevAnchor;
-                   curAnchor.avail = prevAnchor.avail;
+                   curAnchor.avail = prevAnchor.avail + 1;
                    curAnchor.tag++;
               } while (!atomic_compare_exchange_weak(&placeholder,&prevAnchor,curAnchor));
 
@@ -284,6 +300,7 @@ void *MallocFromPartial(procheap *heap) {
               void *addr = desc->sb;
 	      return addr;
 }
+
 
 void *MallocFromNewSB(procheap *heap) {
       descriptor* desc = DescAlloc();
@@ -307,13 +324,13 @@ void *MallocFromNewSB(procheap *heap) {
       active *temp = NULL;
       _Atomic(active) placeholder;
       atomic_init(&placeholder, heap->Active);
-      if (atomic_compare_exchange_weak(&placeholder,temp,curActive)){ // size mismatch
+      if (atomic_compare_exchange_weak(&placeholder,temp,curActive)){
          void *addr = desc->sb;
          return addr;
       } else {
          DescRetire(desc);
 	 return NULL;
-      } // control reaches end of non-void function
+      } 
 }
 
 void mm_init() {
@@ -368,7 +385,7 @@ void mm_free(void *ptr) {
 	    curAnchor.count++;
 	    atomic_thread_fence(memory_order_seq_cst);
 	}
-      } while(!atomic_compare_exchange_weak(&placeholder, &prevAnchor,     curAnchor)); // invalid initializer
+      } while(!atomic_compare_exchange_weak(&placeholder, &prevAnchor,     curAnchor)); 
 
       if (prevAnchor.state == STATE_EMPTY) {
           RemoveEmptyDesc(heap,desc);
